@@ -3,12 +3,14 @@ import numpy as np
 import pandas as pd
 import joblib
 from pathlib import Path
+import shap
+import matplotlib.pyplot as plt
 
 # =========================
 # KONFIGURASI HALAMAN
 # =========================
 st.set_page_config(
-    page_title="Simulator Risiko Mesin",
+    page_title="Simulator Risiko Kegagalan Mesin",
     page_icon="⚙️",
     layout="wide"
 )
@@ -27,10 +29,19 @@ load_css("style.css")
 # =========================
 # LOAD MODEL DAN SCALER
 # =========================
-model = joblib.load("model_risiko_v1.joblib")
-scaler = joblib.load("scaler_risiko_v1.joblib")
+@st.cache_resource
+def load_model_and_scaler():
+    model_loaded = joblib.load("model_risiko_v1.joblib")
+    scaler_loaded = joblib.load("scaler_risiko_v1.joblib")
+    return model_loaded, scaler_loaded
 
-# Data training sesuai kode dosen
+model, scaler = load_model_and_scaler()
+
+# =========================
+# DATA TRAINING SESUAI PRAKTIKUM DOSEN
+# =========================
+FEATURE_NAMES = ["Suhu Mesin", "Getaran Mesin"]
+
 X_train = np.array([
     [60, 2],
     [70, 4],
@@ -39,36 +50,162 @@ X_train = np.array([
     [100, 10]
 ])
 
-TRAIN_MEAN_REF = np.mean(X_train)
+X_train_scaled = scaler.transform(X_train)
+TRAIN_MEAN = np.mean(X_train, axis=0)
+TRAIN_STD = np.std(X_train, axis=0)
 
 # =========================
 # FUNGSI DATA DRIFT
 # =========================
-def check_data_drift(new_data, train_mean, threshold=2.0):
-    drift = np.abs(np.mean(new_data) - np.mean(train_mean))
+def check_data_drift(new_data, train_mean, train_std, threshold=2.0):
+    """
+    Drift dicek berdasarkan z-score per fitur.
+    Jika salah satu fitur melewati ±2 standar deviasi, sistem memberi warning.
+    """
+    z_scores = np.abs((new_data[0] - train_mean) / train_std)
+    max_z = np.max(z_scores)
 
-    if drift > threshold:
-        return "WARNING", f"Terdeteksi data drift sebesar {drift:.2f}. Model perlu dievaluasi ulang."
+    if max_z > threshold:
+        return (
+            "WARNING",
+            f"Terdeteksi data drift. Nilai penyimpangan maksimum adalah {max_z:.2f} standar deviasi. "
+            "Model perlu dievaluasi ulang sebelum hasil digunakan sebagai dasar keputusan penting."
+        )
     else:
-        return "STABIL", f"Data input masih stabil. Nilai drift sebesar {drift:.2f}."
+        return (
+            "STABIL",
+            f"Data input masih sesuai dengan profil data training. "
+            f"Nilai penyimpangan maksimum adalah {max_z:.2f} standar deviasi."
+        )
 
 # =========================
 # FUNGSI ANONYMIZATION
 # =========================
 def clean_sensitive_data(df_input):
     cols_to_remove = ["Nama_Operator", "NIK_Petugas", "Alamat"]
-    return df_input.drop(columns=[c for c in cols_to_remove if c in df_input.columns], errors="ignore")
+    return df_input.drop(
+        columns=[c for c in cols_to_remove if c in df_input.columns],
+        errors="ignore"
+    )
 
 # =========================
-# FUNGSI KEPUTUSAN
+# FUNGSI KATEGORI RISIKO
 # =========================
 def decision_logic(risk_score):
     if risk_score >= 70:
-        return "Risiko Tinggi", "Prioritas 1", "Lakukan pemeriksaan mesin segera dan prioritaskan pemeliharaan."
+        return (
+            "Risiko Tinggi",
+            "Prioritas 1",
+            "Lakukan pemeriksaan mesin segera dan prioritaskan pemeliharaan."
+        )
     elif risk_score >= 30:
-        return "Risiko Sedang", "Prioritas 2", "Lakukan monitoring berkala dan jadwalkan pemeriksaan teknis."
+        return (
+            "Risiko Sedang",
+            "Prioritas 2",
+            "Lakukan monitoring berkala dan jadwalkan pemeriksaan teknis."
+        )
     else:
-        return "Risiko Rendah", "Prioritas 3", "Mesin masih aman, cukup lakukan pemantauan rutin."
+        return (
+            "Risiko Rendah",
+            "Prioritas 3",
+            "Mesin masih aman, cukup lakukan pemantauan rutin."
+        )
+
+# =========================
+# FUNGSI SPK SAW
+# =========================
+def calculate_saw_ranking(risk_score):
+    """
+    Metode SAW digunakan untuk membuat ranking rekomendasi tindakan.
+
+    Kriteria:
+    1. Risiko_Sisa = cost
+    2. Biaya = cost
+    3. Efektivitas = benefit
+    4. Kecepatan = benefit
+    """
+
+    alternatives = pd.DataFrame({
+        "Alternatif": [
+            "Pemeriksaan Mesin Segera",
+            "Monitoring Berkala",
+            "Pemantauan Rutin"
+        ],
+        "Risiko_Sisa": [
+            max(risk_score * 0.35, 5),
+            max(risk_score * 0.65, 10),
+            max(risk_score * 0.90, 15)
+        ],
+        "Biaya": [80, 45, 20],
+        "Efektivitas": [95, 70, 40],
+        "Kecepatan": [90, 65, 45]
+    })
+
+    bobot = {
+        "Risiko_Sisa": 0.40,
+        "Biaya": 0.20,
+        "Efektivitas": 0.25,
+        "Kecepatan": 0.15
+    }
+
+    normalisasi = alternatives.copy()
+
+    # Cost: semakin kecil semakin baik
+    normalisasi["Risiko_Sisa"] = alternatives["Risiko_Sisa"].min() / alternatives["Risiko_Sisa"]
+    normalisasi["Biaya"] = alternatives["Biaya"].min() / alternatives["Biaya"]
+
+    # Benefit: semakin besar semakin baik
+    normalisasi["Efektivitas"] = alternatives["Efektivitas"] / alternatives["Efektivitas"].max()
+    normalisasi["Kecepatan"] = alternatives["Kecepatan"] / alternatives["Kecepatan"].max()
+
+    alternatives["Skor_SAW"] = (
+        normalisasi["Risiko_Sisa"] * bobot["Risiko_Sisa"] +
+        normalisasi["Biaya"] * bobot["Biaya"] +
+        normalisasi["Efektivitas"] * bobot["Efektivitas"] +
+        normalisasi["Kecepatan"] * bobot["Kecepatan"]
+    )
+
+    alternatives["Ranking"] = alternatives["Skor_SAW"].rank(
+        ascending=False,
+        method="dense"
+    ).astype(int)
+
+    alternatives = alternatives.sort_values("Ranking")
+
+    return alternatives
+
+# =========================
+# FUNGSI SHAP / XAI
+# =========================
+def make_shap_explanation(data_scaled, data_asli):
+    """
+    SHAP digunakan untuk menjelaskan kontribusi fitur terhadap hasil prediksi.
+    Nilai SHAP positif berarti fitur menaikkan skor risiko.
+    Nilai SHAP negatif berarti fitur menurunkan skor risiko.
+    """
+    explainer = shap.Explainer(
+        model,
+        X_train_scaled,
+        feature_names=FEATURE_NAMES
+    )
+
+    shap_values = explainer(data_scaled)
+    nilai_shap = shap_values.values[0]
+
+    shap_df = pd.DataFrame({
+        "Fitur": FEATURE_NAMES,
+        "Nilai Input": data_asli[0],
+        "Nilai SHAP": nilai_shap,
+        "Dampak": [
+            "Meningkatkan risiko" if nilai > 0 else "Menurunkan risiko"
+            for nilai in nilai_shap
+        ]
+    })
+
+    shap_df["Pengaruh Absolut"] = shap_df["Nilai SHAP"].abs()
+    shap_df = shap_df.sort_values("Pengaruh Absolut", ascending=False)
+
+    return shap_df[["Fitur", "Nilai Input", "Nilai SHAP", "Dampak"]], shap_values
 
 # =========================
 # HEADER
@@ -76,11 +213,12 @@ def decision_logic(risk_score):
 st.markdown(
     """
     <div class="hero">
-        <p class="badge">Minggu 15 • Finalisasi Proyek dan MLOps</p>
+        <p class="badge">Minggu 16 • UAS Integrasi Akhir</p>
         <h1>Simulator Risiko Kegagalan Mesin</h1>
         <p>
-            Aplikasi ini memuat model machine learning dari file Joblib, melakukan inference,
-            monitoring data drift, dan memberikan rekomendasi keputusan berbasis risiko.
+            Aplikasi ini mengintegrasikan input Streamlit, preprocessing scaler,
+            model machine learning, monitoring data drift, explainability menggunakan SHAP,
+            anonymization, dan sistem pendukung keputusan berbasis metode SAW.
         </p>
     </div>
     """,
@@ -88,7 +226,7 @@ st.markdown(
 )
 
 # =========================
-# INPUT DAN INFORMASI
+# INPUT DAN INFORMASI SISTEM
 # =========================
 col_input, col_info = st.columns([1, 1.2], gap="large")
 
@@ -113,16 +251,16 @@ with col_input:
 
     st.caption("Input yang digunakan hanya data teknis mesin, bukan data pribadi operator.")
 
-    proses = st.button("Jalankan Simulasi Risiko", use_container_width=True)
+    proses = st.button("Jalankan Simulasi Risiko", width="stretch")
 
 with col_info:
     st.subheader("Informasi Sistem")
 
     st.write(
         """
-        Sistem ini menerapkan alur MLOps sederhana. Model dan scaler disimpan ke dalam file,
-        lalu dimuat ulang pada aplikasi Streamlit. Data baru diproses menggunakan scaler yang sama
-        sebelum masuk ke model prediksi.
+        Sistem ini menerapkan alur integrasi akhir. Data dari input pengguna diproses menggunakan scaler,
+        kemudian diprediksi oleh model machine learning. Hasil prediksi digunakan sebagai dasar sistem
+        pendukung keputusan untuk menghasilkan ranking rekomendasi tindakan.
         """
     )
 
@@ -132,7 +270,7 @@ with col_info:
         st.markdown(
             """
             <div class="mini-card">
-                <h4>Model</h4>
+                <h4>Model ML</h4>
                 <p>Linear Regression</p>
             </div>
             """,
@@ -154,8 +292,8 @@ with col_info:
         st.markdown(
             """
             <div class="mini-card">
-                <h4>Deployment</h4>
-                <p>Streamlit Cloud</p>
+                <h4>SPK</h4>
+                <p>SAW Ranking</p>
             </div>
             """,
             unsafe_allow_html=True
@@ -168,6 +306,7 @@ if proses:
     st.markdown("---")
     st.subheader("Hasil Simulasi Risiko")
 
+    # Contoh data mentah yang masih mengandung data sensitif
     raw_df = pd.DataFrame({
         "Nama_Operator": ["Disembunyikan"],
         "NIK_Petugas": ["Disembunyikan"],
@@ -177,12 +316,22 @@ if proses:
 
     cleaned_df = clean_sensitive_data(raw_df)
 
+    # Data input untuk model
     data_baru = np.array([[suhu, getaran]])
     data_scaled = scaler.transform(data_baru)
-    risk_score = model.predict(data_scaled)[0]
 
+    # Prediksi ML
+    risk_score = float(model.predict(data_scaled)[0])
+
+    # Kategori risiko
     kategori, prioritas, rekomendasi = decision_logic(risk_score)
-    status_drift, pesan_drift = check_data_drift(data_baru, TRAIN_MEAN_REF)
+
+    # Drift check
+    status_drift, pesan_drift = check_data_drift(
+        data_baru,
+        TRAIN_MEAN,
+        TRAIN_STD
+    )
 
     hasil1, hasil2, hasil3 = st.columns(3)
 
@@ -193,7 +342,7 @@ if proses:
         st.metric("Kategori Risiko", kategori)
 
     with hasil3:
-        st.metric("Prioritas", prioritas)
+        st.metric("Prioritas Awal", prioritas)
 
     if kategori == "Risiko Tinggi":
         st.error(rekomendasi)
@@ -202,6 +351,9 @@ if proses:
     else:
         st.success(rekomendasi)
 
+    # =========================
+    # MONITORING DATA DRIFT
+    # =========================
     st.subheader("Monitoring Data Drift")
 
     if status_drift == "WARNING":
@@ -209,15 +361,79 @@ if proses:
     else:
         st.success(pesan_drift)
 
-    st.subheader("Data Setelah Anonymization")
-    st.dataframe(cleaned_df, use_container_width=True)
+    # =========================
+    # SPK SAW
+    # =========================
+    st.subheader("Ranking Rekomendasi Tindakan Menggunakan SAW")
 
+    ranking_df = calculate_saw_ranking(risk_score)
+
+    st.dataframe(
+        ranking_df,
+        hide_index=True,
+        width="stretch"
+    )
+
+    rekomendasi_terbaik = ranking_df.iloc[0]["Alternatif"]
+
+    st.success(
+        f"Berdasarkan perhitungan SAW, rekomendasi tindakan terbaik adalah: {rekomendasi_terbaik}."
+    )
+
+    # =========================
+    # XAI / SHAP
+    # =========================
+    st.subheader("Penjelasan Model Menggunakan SHAP")
+
+    try:
+        shap_df, shap_values = make_shap_explanation(data_scaled, data_baru)
+
+        st.write(
+            """
+            Bagian ini menunjukkan kontribusi setiap fitur terhadap hasil prediksi menggunakan nilai SHAP.
+            Nilai SHAP positif berarti fitur tersebut menaikkan skor risiko, sedangkan nilai SHAP negatif
+            berarti fitur tersebut menurunkan skor risiko.
+            """
+        )
+
+        st.dataframe(
+            shap_df,
+            hide_index=True,
+            width="stretch"
+        )
+
+        st.write("Grafik SHAP berikut memperlihatkan arah dan besar kontribusi fitur terhadap prediksi saat ini.")
+
+        fig = plt.figure()
+        shap.plots.waterfall(shap_values[0], show=False)
+        st.pyplot(plt.gcf())
+        plt.close(fig)
+
+    except Exception as e:
+        st.warning("Visualisasi SHAP tidak dapat ditampilkan, tetapi sistem tetap menampilkan hasil prediksi.")
+        st.caption(f"Detail teknis: {e}")
+
+    # =========================
+    # ANONYMIZATION
+    # =========================
+    st.subheader("Data Setelah Anonymization")
+
+    st.dataframe(
+        cleaned_df,
+        width="stretch"
+    )
+
+    # =========================
+    # INTERPRETASI
+    # =========================
     st.subheader("Interpretasi Singkat")
+
     st.write(
         f"""
         Berdasarkan input suhu mesin sebesar **{suhu}** dan getaran mesin sebesar **{getaran}**,
         model menghasilkan skor risiko sebesar **{risk_score:.2f}**. Hasil tersebut masuk kategori
-        **{kategori}**, sehingga rekomendasi sistem adalah **{rekomendasi}**
+        **{kategori}**. Setelah dihitung menggunakan metode SAW, rekomendasi tindakan terbaik adalah
+        **{rekomendasi_terbaik}**.
         """
     )
 
@@ -227,8 +443,8 @@ if proses:
 st.markdown(
     """
     <div class="footer">
-        Project Praktikum Minggu 15: Persistensi Model, Inference, Monitoring Drift,
-        Etika Data, dan Deployment Streamlit.
+        Project UAS Minggu 16: Integrasi Streamlit, Scaler, Machine Learning, SHAP,
+        Data Drift, Anonymization, dan SPK SAW.
     </div>
     """,
     unsafe_allow_html=True
